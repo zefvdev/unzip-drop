@@ -6,6 +6,8 @@
 import Foundation
 import CryptoKit
 import Compression
+import UIKit
+import CommonCrypto
 
 struct BackupEntry: Codable {
     let id: String
@@ -209,7 +211,7 @@ final class BackupManager: ObservableObject {
                 compression_decode_buffer(
                     destBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) ?? UnsafeMutablePointer<UInt8>(bitPattern: 0)!,
                     decompressed.count,
-                    srcBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) ?? UnsafeRawPointer(bitPattern: 0)!,
+                    srcBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) ?? UnsafePointer<UInt8>(bitPattern: 0)!,
                     data.count,
                     nil,
                     COMPRESSION_ZLIB
