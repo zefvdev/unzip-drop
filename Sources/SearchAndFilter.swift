@@ -57,7 +57,7 @@ final class CertificateSearchManager: ObservableObject {
                 cert.name.localizedCaseInsensitiveContains(searchText) ||
                 (try? Data(contentsOf: cert.provisionURL))
                     .map { CertificateStore.profileInfo($0) }
-                    .flatMap { [$0.team, $0.name].compactMap { $0 } }
+                    .flatMap { [$0.team, $0.name].compactMap { $0 } }?
                     .contains { $0.localizedCaseInsensitiveContains(searchText) } ?? false
             }
         }
