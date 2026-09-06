@@ -15,11 +15,11 @@ struct BackupEntry: Codable {
     let provisionData: Data
     let password: String
     let timestamp: Date
-    let bundleVersion: String = "1.0"
+    var bundleVersion: String = "1.0"
 }
 
 struct BackupFile: Codable {
-    let version: String = "1.0"
+    var version: String = "1.0"
     let createdAt: Date
     let deviceName: String
     let entries: [BackupEntry]
@@ -148,7 +148,7 @@ final class BackupManager: ObservableObject {
                 restoredCount += 1
             } catch {
                 failedCerts.append(entry.name)
-                ZLog.warn("Failed to restore certificate \(entry.name): \(error.localizedDescription)\n")
+                NSLog("[Backup] Failed to restore certificate %@: %@", entry.name, error.localizedDescription)
             }
         }
         
