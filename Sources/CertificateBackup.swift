@@ -7,7 +7,6 @@ import Foundation
 import CryptoKit
 import Compression
 import UIKit
-import CommonCrypto
 
 struct BackupEntry: Codable {
     let id: String
@@ -261,10 +260,7 @@ enum BackupError: LocalizedError {
 extension String {
     func sha256Hash() -> String {
         let data = Data(self.utf8)
-        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
-        data.withUnsafeBytes {
-            _ = CC_SHA256($0.baseAddress, CC_LONG(data.count), &digest)
-        }
+        let digest = Insecure.SHA1.hash(data: data)
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 }
