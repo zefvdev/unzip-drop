@@ -31,8 +31,11 @@ final class BackupManager: ObservableObject {
     static let shared = BackupManager()
     @Published var backups: [BackupMetadata] = []
     @Published var lastBackupDate: Date? = nil
+    @Published var lastError: String? = nil
     
     private let backupDir = AppPaths.dir("backups")
+    private let encryptionKeyIdentifier = "com.unzipdrop.backup.key"
+    private static let maxBackupSize = 500 * 1024 * 1024 // 500MB limit
     
     struct BackupMetadata: Identifiable, Codable {
         let id: String
@@ -58,7 +61,7 @@ final class BackupManager: ObservableObject {
     }
     
     /// Create encrypted backup of all certificates
-    func createBackup(certificates: [Certificate]) throws -> BackupMetadata {
+    func createBackup(certificates: [Certificate]) async throws -> BackupMetadata {
         var entries: [BackupEntry] = []
         
         for cert in certificates {
@@ -78,6 +81,11 @@ final class BackupManager: ObservableObject {
             ))
         }
         
+        guard !entries.isEmpty else {
+            lastError = "No certificates to backup"
+            throw BackupError.encryptionFailed
+        }
+        
         let backup = BackupFile(
             createdAt: Date(),
             deviceName: UIDevice.current.name,
@@ -89,36 +97,26 @@ final class BackupManager: ObservableObject {
         let encoded = try JSONEncoder().encode(backup)
         let compressed = try compressData(encoded)
         
+        // Check size limit
+        guard compressed.count <= Self.maxBackupSize else {
+            lastError = "Backup size exceeds 500MB limit"
+            throw BackupError.compressionFailed
+        }
+        
         // Encrypt with device key
         let encrypted = try encryptData(compressed)
         
-        // Save to file
-        let backupID = UUID().uuidString
-        let fileName = "backup-\(backupID).uzd"
-        let fileURL = backupDir.appendingPathComponent(fileName)
-        try encrypted.write(to: fileURL)
-        
-        let metadata = BackupMetadata(
-            id: backupID,
-            deviceName: backup.deviceName,
-            createdAt: backup.createdAt,
-            certificateCount: entries.count,
-            fileSize: encrypted.count
-        )
-        
-        backups.append(metadata)
-        lastBackupDate = Date()
-        saveMetadata()
-        
-        return metadata
+        // Save to file in background
+        return try await saveBackupFile(encrypted: encrypted, backup: backup)
     }
     
     /// Restore certificates from backup
-    func restoreBackup(metadata: BackupMetadata, store: CertificateStore) throws {
+    func restoreBackup(metadata: BackupMetadata, store: CertificateStore) async throws -> Int {
         let fileName = "backup-\(metadata.id).uzd"
         let fileURL = backupDir.appendingPathComponent(fileName)
         
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            lastError = "Backup file not found"
             throw BackupError.backupNotFound
         }
         
@@ -130,11 +128,14 @@ final class BackupManager: ObservableObject {
         // Verify checksum
         let calculatedHash = backup.entries.map { $0.id }.joined().sha256Hash()
         guard calculatedHash == backup.checksumHash else {
+            lastError = "Backup integrity check failed"
             throw BackupError.corruptedBackup
         }
         
         // Restore entries
         var restoredCount = 0
+        var failedCerts: [String] = []
+        
         for entry in backup.entries {
             do {
                 _ = try store.importPair(
@@ -146,13 +147,22 @@ final class BackupManager: ObservableObject {
                 )
                 restoredCount += 1
             } catch {
-                print("Failed to restore certificate \(entry.name): \(error)")
+                failedCerts.append(entry.name)
+                ZLog.warn("Failed to restore certificate \(entry.name): \(error.localizedDescription)\n")
             }
         }
+        
+        if !failedCerts.isEmpty {
+            lastError = "Restored \(restoredCount)/\(backup.entries.count) certificates. Failed: \(failedCerts.joined(separator: ", "))"
+        } else {
+            lastError = "Successfully restored \(restoredCount) certificates"
+        }
+        
+        return restoredCount
     }
     
     /// Export backup to Files app
-    func exportBackup(metadata: BackupMetadata, to destination: URL) throws {
+    func exportBackup(metadata: BackupMetadata, to destination: URL) async throws {
         let fileName = "backup-\(metadata.id).uzd"
         let fileURL = backupDir.appendingPathComponent(fileName)
         let timestamp = metadata.createdAt.formatted(date: .abbreviated, time: .omitted).replacingOccurrences(of: "/", with: "-")
@@ -160,65 +170,140 @@ final class BackupManager: ObservableObject {
         let exportURL = destination.appendingPathComponent(exportName)
         
         try FileManager.default.copyItem(at: fileURL, to: exportURL)
+        lastError = "Backup exported successfully"
     }
     
     /// Delete backup
-    func deleteBackup(metadata: BackupMetadata) throws {
+    func deleteBackup(metadata: BackupMetadata) async throws {
         let fileName = "backup-\(metadata.id).uzd"
         let fileURL = backupDir.appendingPathComponent(fileName)
         try FileManager.default.removeItem(at: fileURL)
         backups.removeAll { $0.id == metadata.id }
-        saveMetadata()
+        await MainActor.run { saveMetadata() }
     }
     
     // MARK: - Private Helpers
     
-    private func encryptData(_ data: Data) throws -> Data {
+    private func getOrCreateEncryptionKey() throws -> SymmetricKey {
+        // Try to retrieve key from Keychain
+        if let keyData = Keychain.get(encryptionKeyIdentifier),
+           let data = Data(base64Encoded: keyData) {
+            return SymmetricKey(data: data)
+        }
+        
+        // Generate new key and store in Keychain
         let key = SymmetricKey(size: .bits256)
-        let box = try AES.GCM.seal(data, using: key)
-        return box.combined ?? data
+        let keyData = key.withUnsafeBytes { Data($0) }
+        Keychain.set(encryptionKeyIdentifier, keyData.base64EncodedString())
+        return key
+    }
+    
+    private func encryptData(_ data: Data) throws -> Data {
+        do {
+            let key = try getOrCreateEncryptionKey()
+            let box = try AES.GCM.seal(data, using: key)
+            guard let combined = box.combined else {
+                lastError = "Encryption failed: could not combine cipher and nonce"
+                throw BackupError.encryptionFailed
+            }
+            return combined
+        } catch {
+            lastError = "Encryption error: \(error.localizedDescription)"
+            throw BackupError.encryptionFailed
+        }
     }
     
     private func decryptData(_ data: Data) throws -> Data {
-        // In production, use Keychain to retrieve stored key
-        let key = SymmetricKey(size: .bits256)
-        let box = try AES.GCM.SealedBox(combined: data)
-        return try AES.GCM.open(box, using: key)
+        do {
+            let key = try getOrCreateEncryptionKey()
+            let box = try AES.GCM.SealedBox(combined: data)
+            return try AES.GCM.open(box, using: key)
+        } catch {
+            lastError = "Decryption error: \(error.localizedDescription)"
+            throw BackupError.corruptedBackup
+        }
     }
     
     private func compressData(_ data: Data) throws -> Data {
         var compressed = Data()
-        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: data.count)
+        let sourceCount = data.count
+        let destinationCapacity = sourceCount + (sourceCount / 16) + 64 // Add extra buffer
+        
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: destinationCapacity)
         defer { buffer.deallocate() }
         
-        let compressedSize = compression_encode_buffer(
-            buffer, data.count,
-            (data as NSData).bytes.assumingMemoryBound(to: UInt8.self),
-            data.count,
-            nil,
-            COMPRESSION_ZLIB
-        )
+        let compressedSize = data.withUnsafeBytes { sourceBuffer -> Int in
+            guard let sourceBytes = sourceBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return 0
+            }
+            return compression_encode_buffer(
+                buffer, destinationCapacity,
+                sourceBytes, sourceCount,
+                nil,
+                COMPRESSION_ZLIB
+            )
+        }
+        
+        guard compressedSize > 0 else {
+            lastError = "Compression failed or returned empty result"
+            throw BackupError.compressionFailed
+        }
         
         compressed = Data(bytes: buffer, count: compressedSize)
         return compressed
     }
     
     private func decompressData(_ data: Data) throws -> Data {
-        var decompressed = Data(count: data.count * 4)
+        // Start with 4x the compressed size
+        var decompressed = Data(count: max(data.count * 4, 1024))
+        
         let decompressedSize = decompressed.withUnsafeMutableBytes { destBuffer in
-            data.withUnsafeBytes { srcBuffer in
-                compression_decode_buffer(
-                    destBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) ?? UnsafeMutablePointer<UInt8>(bitPattern: 0)!,
+            data.withUnsafeBytes { srcBuffer -> Int in
+                guard let destBytes = destBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let srcBytes = srcBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return 0
+                }
+                return compression_decode_buffer(
+                    destBytes,
                     decompressed.count,
-                    srcBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) ?? UnsafePointer<UInt8>(bitPattern: 0)!,
+                    srcBytes,
                     data.count,
                     nil,
                     COMPRESSION_ZLIB
                 )
             }
         }
+        
+        guard decompressedSize > 0 else {
+            lastError = "Decompression failed"
+            throw BackupError.compressionFailed
+        }
+        
         decompressed.count = decompressedSize
         return decompressed
+    }
+    
+    private func saveBackupFile(encrypted: Data, backup: BackupFile) async throws -> BackupMetadata {
+        let backupID = UUID().uuidString
+        let fileName = "backup-\(backupID).uzd"
+        let fileURL = backupDir.appendingPathComponent(fileName)
+        
+        try encrypted.write(to: fileURL)
+        
+        let metadata = BackupMetadata(
+            id: backupID,
+            deviceName: backup.deviceName,
+            createdAt: backup.createdAt,
+            certificateCount: backup.entries.count,
+            fileSize: encrypted.count
+        )
+        
+        backups.append(metadata)
+        lastBackupDate = Date()
+        saveMetadata()
+        lastError = "Backup created successfully"
+        
+        return metadata
     }
     
     private func loadBackups() {
@@ -231,8 +316,14 @@ final class BackupManager: ObservableObject {
     }
     
     private func saveMetadata() {
-        if let encoded = try? JSONEncoder().encode(backups) {
-            try? encoded.write(to: backupDir.appendingPathComponent(".metadata.json"))
+        guard let encoded = try? JSONEncoder().encode(backups) else {
+            lastError = "Failed to encode metadata"
+            return
+        }
+        do {
+            try encoded.write(to: backupDir.appendingPathComponent(".metadata.json"))
+        } catch {
+            lastError = "Failed to save metadata: \(error.localizedDescription)"
         }
     }
 }
@@ -242,17 +333,20 @@ enum BackupError: LocalizedError {
     case corruptedBackup
     case encryptionFailed
     case compressionFailed
+    case invalidInput
     
     var errorDescription: String? {
         switch self {
         case .backupNotFound:
             return "Backup file not found."
         case .corruptedBackup:
-            return "Backup file is corrupted or invalid."
+            return "Backup file is corrupted or integrity check failed."
         case .encryptionFailed:
             return "Failed to encrypt backup."
         case .compressionFailed:
-            return "Failed to compress backup."
+            return "Failed to compress or decompress backup."
+        case .invalidInput:
+            return "Invalid backup input."
         }
     }
 }
